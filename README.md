@@ -6,7 +6,7 @@ A real-time hand tracking application that detects and measures "thumbs up" and 
 
 ## Demo
 
-![Demo Video](tracker.webm)
+![Image](https://github.com/user-attachments/assets/f5262480-7765-458d-ab2f-99fa2a0c0d17)
 
 ## Features
 
