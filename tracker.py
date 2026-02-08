@@ -5,6 +5,7 @@ os.environ['GLOG_minloglevel'] = '2'
 import cv2
 import mediapipe as mp
 import math
+import numpy as np 
 import uvicorn
 import threading
 import time
@@ -38,7 +39,7 @@ class TrackerStatus(BaseModel):
     percentage: int
     detected: bool
     hand: str
-    orientation: str
+    orientation: str # Informational
 
 # --- The Tracker Engine ---
 class HandTracker:
@@ -54,22 +55,22 @@ class HandTracker:
         self.orientation = "None"
         self.latest_frame_bytes = None
         
-        # Config (Tuned Defaults)
-        self.min_ratio = 0.28
-        self.max_ratio = 0.95
+        # Config (Tuned for V2.1 - Shorter Vector)
+        # Vector is now MCP(2)->Tip(4), which is shorter.
+        # Palm Width is usually wider than Thumb Length.
+        # Adjusted max_ratio down to 0.75 so 100% is reachable.
+        self.min_ratio = 0.12 
+        self.max_ratio = 0.68
         
-        # Optimization: Only encode JPEGs if clients are watching
         self.active_clients = 0
-
-        # --- SMOOTHING ---
-        self.history = deque(maxlen=15)
+        self.history = deque(maxlen=15) # 500ms smoothing
 
     def start(self):
         if self.running: return
         self.running = True
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
-        print(f"--- Tracker Started ---")
+        print(f"--- Tracker V2.1 (MCP Anchor) Started ---")
 
     def stop(self):
         self.running = False
@@ -84,40 +85,53 @@ class HandTracker:
             self.history.clear()
             print(f"Config Updated: {self.min_ratio} - {self.max_ratio}")
 
-    def _get_dist(self, p1, p2) -> float:
-        return math.hypot(p1.x - p2.x, p1.y - p2.y)
-
-    def _calculate_logic(self, landmarks) -> Tuple[float, str]:
-        # 4=ThumbTip, 5=IndexMCP, 6=IndexPIP, 17=PinkyMCP
-        t_tip, i_mcp = landmarks[4], landmarks[5]
-        i_pip, p_mcp = landmarks[6], landmarks[17]
-
-        # 1. Orientation Analysis
-        dy = p_mcp.y - i_mcp.y 
-        dx = p_mcp.x - i_mcp.x
+    def _calculate_vector_logic(self, landmarks) -> Tuple[float, str, dict]:
+        """
+        V2.1: Projects Thumb Vector (MCP->Tip) onto the Pinky->Index Vector.
+        """
+        # Points
+        # CHANGED: Use Landmark 2 (MCP) instead of 1 (CMC)
+        p_thumb_base = np.array([landmarks[2].x, landmarks[2].y])
+        p_thumb_tip = np.array([landmarks[4].x, landmarks[4].y])
         
-        # If horizontal spread > vertical spread, ignore it
-        if abs(dx) > abs(dy):
-            return 0.0, "Horizontal"
-            
-        is_up = dy > 0
-        orientation = "Up" if is_up else "Down"
+        p_index_mcp = np.array([landmarks[5].x, landmarks[5].y])
+        p_pinky_mcp = np.array([landmarks[17].x, landmarks[17].y])
 
-        # 2. Palm Width (Scale)
-        width = self._get_dist(i_mcp, p_mcp)
-        if width == 0: return 0.0, orientation
-
-        # 3. Elevation (Thumb)
-        ref_y = i_mcp.y
+        # 1. Reference Vector (The "Spine" of the hand)
+        vec_ref = p_index_mcp - p_pinky_mcp
         
-        if orientation == "Up":
-            elevation = ref_y - t_tip.y
-        else:
-            elevation = t_tip.y - ref_y
-            
-        if elevation < 0: return 0.0, orientation
+        # Magnitude (Palm Width) for scaling
+        palm_width = np.linalg.norm(vec_ref)
+        if palm_width == 0: return 0.0, "None", {}
+        
+        # Unit Vector of Reference
+        vec_ref_unit = vec_ref / palm_width
 
-        return elevation / width, orientation
+        # 2. Thumb Vector
+        vec_thumb = p_thumb_tip - p_thumb_base
+
+        # 3. Scalar Projection (Dot Product)
+        projection = np.dot(vec_thumb, vec_ref_unit)
+        
+        # 4. Normalize
+        ratio = max(0.0, projection / palm_width)
+
+        # 5. Orientation Label (just for debug)
+        orient = "Neutral"
+        if ratio > 0.2: orient = "Extended"
+
+        debug_data = {
+            "p_index": p_index_mcp,
+            "p_pinky": p_pinky_mcp,
+            "p_thumb_b": p_thumb_base,
+            "p_thumb_t": p_thumb_tip,
+            "vec_ref": vec_ref,
+            "vec_thumb": vec_thumb,
+            "vec_ref_unit": vec_ref_unit,
+            "projection_len": projection
+        }
+
+        return ratio, orient, debug_data
 
     def _loop(self):
         if not os.path.exists(MODEL_PATH):
@@ -154,7 +168,7 @@ class HandTracker:
                 orient = "None"
                 detected = False
                 label = "None"
-                draw_proto = None
+                debug_data = {}
 
                 if result.hand_landmarks:
                     detected = True
@@ -165,16 +179,15 @@ class HandTracker:
                         if d < min_d: min_d, closest = d, i
                     
                     target = result.hand_landmarks[closest]
-                    draw_proto = target
                     if len(result.handedness) > closest:
                         label = result.handedness[closest][0].category_name
                     
-                    raw_ratio, orient = self._calculate_logic(target)
+                    raw_ratio, orient, debug_data = self._calculate_vector_logic(target)
 
-                # --- SMOOTHING LOGIC ---
+                # --- SMOOTHING ---
                 final_percentage = 0.0
                 
-                if detected and orient in ["Up", "Down"]:
+                if detected:
                     if raw_ratio < self.min_ratio:
                         target_pct = 0.0
                     else:
@@ -185,8 +198,6 @@ class HandTracker:
                     
                     self.history.append(target_pct)
                     final_percentage = sum(self.history) / len(self.history)
-                    # Scale so comfortable thumbs up (90%+) becomes 100%
-                    final_percentage = min(100.0, final_percentage / 0.9)
                 else:
                     self.history.clear()
                     final_percentage = 0.0
@@ -199,36 +210,35 @@ class HandTracker:
                     self.orientation = orient
                     
                     if self.active_clients > 0:
-                        self._draw_debug(frame, draw_proto, final_percentage, orient)
+                        self._draw_debug(frame, result.hand_landmarks[closest] if detected else None, final_percentage, debug_data)
                         _, buf = cv2.imencode('.jpg', frame)
                         self.latest_frame_bytes = buf.tobytes()
 
                 time.sleep(0.01)
         cap.release()
 
-    def _draw_debug(self, frame, landmarks, val, orient):
-        if not landmarks: 
+    def _draw_debug(self, frame, landmarks, val, debug_data):
+        if not landmarks or not debug_data: 
              cv2.putText(frame, "No Hand", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
              return
 
         h, w, _ = frame.shape
-        px = [(int(l.x*w), int(l.y*h)) for l in landmarks]
+        def to_px(pt): return (int(pt[0]*w), int(pt[1]*h))
 
+        px_landmarks = [(int(l.x*w), int(l.y*h)) for l in landmarks]
         for i, j in HAND_CONNECTIONS:
-            if i<len(px) and j<len(px): cv2.line(frame, px[i], px[j], (0,255,0), 1)
+            if i<len(px_landmarks) and j<len(px_landmarks): cv2.line(frame, px_landmarks[i], px_landmarks[j], (0,255,0), 1)
 
-        i_mcp, i_pip = px[5], px[6]
-        t_tip = px[4]
-        ref_y = int((i_mcp[1] + i_pip[1]) / 2)
-
-        cv2.line(frame, (px[5][0]-40, ref_y), (px[5][0]+40, ref_y), (255,0,0), 2)
-        cv2.line(frame, px[5], px[17], (0,255,255), 2)
-
-        if (orient == "Up" and t_tip[1] < ref_y) or (orient == "Down" and t_tip[1] > ref_y):
-            cv2.line(frame, t_tip, (t_tip[0], ref_y), (0,0,255), 3)
-
+        p_idx = to_px(debug_data["p_index"])
+        p_pnk = to_px(debug_data["p_pinky"])
+        p_tb = to_px(debug_data["p_thumb_b"])
+        p_tt = to_px(debug_data["p_thumb_t"])
+        
+        cv2.arrowedLine(frame, p_pnk, p_idx, (0, 255, 255), 3, tipLength=0.1)
+        cv2.arrowedLine(frame, p_tb, p_tt, (0, 0, 255), 3, tipLength=0.1)
+        
         cv2.putText(frame, f"Val: {int(round(val))}%", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-        cv2.putText(frame, f"Orient: {orient}", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 1)
+        cv2.putText(frame, "V2.1: MCP Anchor", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 1)
 
 # --- FastAPI Setup ---
 tracker = HandTracker()

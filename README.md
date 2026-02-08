@@ -62,7 +62,7 @@ The server will start on `http://0.0.0.0:8000` and begin processing the webcam f
 
 #### Get Current Status
 ```bash
-GET http://localhost:8000/status
+curl http://localhost:8000/status
 ```
 
 Returns the current tracking status:
