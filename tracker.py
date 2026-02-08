@@ -185,6 +185,8 @@ class HandTracker:
                     
                     self.history.append(target_pct)
                     final_percentage = sum(self.history) / len(self.history)
+                    # Scale so comfortable thumbs up (90%+) becomes 100%
+                    final_percentage = min(100.0, final_percentage / 0.9)
                 else:
                     self.history.clear()
                     final_percentage = 0.0
